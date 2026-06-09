@@ -100,6 +100,8 @@ CONFIG_OTA_URL="http://192.168.0.148:8003/xiaozhi/ota/"
 | `xiaozhi-bridge` | Linux x86_64 | Debian/Ubuntu 服务器 |
 | `xiaozhi-bridge.exe` | Windows x86_64 | Windows 10/11 |
 
+注：xiaozhi-bridge.exe 下载时可能引起杀毒软件的拦阻或清除，这是误报，请关闭杀毒软件来下载!
+
 ### API 端点
 
 | 端点 | 方法 | 说明 |
