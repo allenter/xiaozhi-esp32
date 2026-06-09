@@ -6,6 +6,14 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config WEBSOCKET_URL
+    string "Default WebSocket URL"
+    default ""
+    help
+        The default WebSocket server URL to connect to.
+        If empty, the URL is derived from OTA_URL.
+        Example: ws://192.168.0.148:8003/xiaozhi/v1
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

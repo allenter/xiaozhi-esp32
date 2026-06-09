@@ -9,9 +9,11 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "ota.h"
+#include "qrcode/qrcode_display.h"
 
-#include <cstring>
 #include <esp_log.h>
+#include <esp_app_desc.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
@@ -302,33 +304,134 @@ void Application::HandleActivationDoneEvent() {
     SystemInfo::PrintHeapStats();
     SetDeviceState(kDeviceStateIdle);
 
-    has_server_time_ = ota_->HasServerTime();
-
     auto display = Board::GetInstance().GetDisplay();
-    std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
+    auto app_desc = esp_app_get_description();
+    std::string message = std::string(Lang::Strings::VERSION) + app_desc->version;
     display->ShowNotification(message.c_str());
     display->SetChatMessage("system", "");
 
-    // Release OTA object after activation is complete
-    ota_.reset();
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
 
     Schedule([this]() {
-        // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     });
 }
 
+// Probe a candidate server with a quick HTTP GET /health.
+// Returns true if the server responds with HTTP 200.
+static bool ProbeServer(const std::string& host, int port) {
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/health", host.c_str(), port);
+    ESP_LOGI("Probe", "Trying %s ...", url);
+    if (!http->Open("GET", url)) {
+        ESP_LOGW("Probe", "%s: connection failed (err=0x%x)", url, http->GetLastError());
+        return false;
+    }
+    int status = http->GetStatusCode();
+    http->Close();
+    bool ok = (status == 200);
+    ESP_LOGI("Probe", "%s -> HTTP %d (%s)", url, status, ok ? "OK" : "FAIL");
+    return ok;
+}
+
 void Application::ActivationTask() {
-    // Create OTA object for activation process
-    ota_ = std::make_unique<Ota>();
+    auto& board = Board::GetInstance();
+    auto display = board.GetDisplay();
+    display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    // Check for new assets version
-    CheckAssetsVersion();
+    // Try 3 candidate servers in order; use the first one that responds.
+    // 1) Local bridge on 192.168.0.88:8003
+    // 2) Remote bridge on hass.iala.top:8003
+    // 3) Original xiaozhi.me cloud (OTA check)
+    struct Candidate {
+        const char* host;
+        int port;
+        const char* ws_url_fmt;   // %s = host, %d = port
+        int ws_version;
+    };
+    // Three candidates:
+    //   1) Local bridge on 192.168.0.88:8003
+    //   2) Remote bridge on hass.iala.top:8003
+    //   3) Original xiaozhi.me cloud — do OTA check to get the MCP WSS URL with token
+    Candidate candidates[] = {
+        {"192.168.0.88",      8003, "ws://%s:%d/xiaozhi/v1", 3},
+        {"hass.iala.top",     8003, "ws://%s:%d/xiaozhi/v1", 3},
+        {"__xiaozhi__",       0,    NULL,                     0},  // special marker
+    };
+    const int NUM_CANDIDATES = sizeof(candidates) / sizeof(candidates[0]);
 
-    // Check for new firmware version
-    CheckNewVersion();
+    std::string chosen_url;
+    int chosen_version = 3;
+
+    for (int i = 0; i < NUM_CANDIDATES; i++) {
+        auto& c = candidates[i];
+        bool ok = false;
+
+        // Third candidate: original xiaozhi.me cloud via OTA
+        if (strcmp(c.host, "__xiaozhi__") == 0) {
+            display->SetStatus("Trying xiaozhi.me...");
+            auto ota = std::make_unique<Ota>();
+            // Use the original default OTA URL: https://api.tenclass.net/xiaozhi/ota/
+            Settings ota_settings("wifi", true);
+            ota_settings.SetString("ota_url", "https://api.tenclass.net/xiaozhi/ota/");
+            esp_err_t err = ota->CheckVersion();
+            if (err == ESP_OK && ota->HasWebsocketConfig()) {
+                // Get the websocket URL from OTA response (includes the token)
+                Settings ws_ota("websocket", false);
+                chosen_url = ws_ota.GetString("url");
+                // Also get version if available
+                int v = ws_ota.GetInt("version");
+                if (v > 0) chosen_version = v;
+                ok = !chosen_url.empty();
+                ESP_LOGI(TAG, "xiaozhi.me OTA returned ws=%s", chosen_url.c_str());
+
+                // Show activation code if present
+                if (ota->HasActivationCode()) {
+                    ShowActivationCode(ota->GetActivationCode(), ota->GetActivationMessage());
+                }
+            } else {
+                ESP_LOGW(TAG, "xiaozhi.me OTA failed: err=%d", err);
+            }
+            ota_settings.SetString("ota_url", CONFIG_OTA_URL); // restore
+        } else {
+            ok = ProbeServer(c.host, c.port);
+        }
+
+        if (ok) {
+        if (strcmp(c.host, "__xiaozhi__") != 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), c.ws_url_fmt, c.host, c.port);
+            chosen_url = buf;
+            chosen_version = c.ws_version;
+        }
+        ESP_LOGI(TAG, "Selected server [%d]: %s", i + 1, chosen_url.c_str());
+        break;
+    }
+    }
+
+    // Fallback to first candidate if none responded
+    if (chosen_url.empty()) {
+        char buf[128];
+        auto& c = candidates[0];
+        snprintf(buf, sizeof(buf), c.ws_url_fmt, c.host, c.port);
+        chosen_url = buf;
+        ESP_LOGW(TAG, "No server responded, using default: %s", chosen_url.c_str());
+    }
+
+    // Store the chosen URL
+    Settings ws_settings("websocket", true);
+    ws_settings.SetString("url", chosen_url);
+    ws_settings.SetInt("version", chosen_version);
+
+    // Show device identifier on screen
+    std::string device_id = SystemInfo::GetMacAddress();
+    char code_msg[64];
+    snprintf(code_msg, sizeof(code_msg), "Code: %s", device_id.c_str());
+    display->SetChatMessage("system", code_msg);
+    ESP_LOGI(TAG, "Device code: %s", device_id.c_str());
 
     // Initialize the protocol
     InitializeProtocol();
@@ -396,9 +499,9 @@ void Application::CheckAssetsVersion() {
 }
 
 void Application::CheckNewVersion() {
-    const int MAX_RETRY = 10;
+    const int MAX_RETRY = 3;
     int retry_count = 0;
-    int retry_delay = 10; // Initial retry delay in seconds
+    int retry_delay = 3; // Initial retry delay in seconds (reduced from 10)
 
     auto& board = Board::GetInstance();
     while (true) {
@@ -409,8 +512,9 @@ void Application::CheckNewVersion() {
         if (err != ESP_OK) {
             retry_count++;
             if (retry_count >= MAX_RETRY) {
-                ESP_LOGE(TAG, "Too many retries, exit version check");
-                return;
+                ESP_LOGW(TAG, "Too many retries (%d), continuing without OTA response", MAX_RETRY);
+                // Don't return — fall through so InitializeProtocol can still try default config
+                break;
             }
 
             char error_message[128];
@@ -422,11 +526,14 @@ void Application::CheckNewVersion() {
             ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
             for (int i = 0; i < retry_delay; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
-                if (GetDeviceState() == kDeviceStateIdle) {
-                    break;
+                // Break out early if user pressed button
+                if (GetDeviceState() != kDeviceStateActivating) {
+                    ESP_LOGI(TAG, "State changed during retry, exiting version check");
+                    return;
                 }
             }
-            retry_delay *= 2; // Double the retry delay
+            retry_delay = retry_delay * 2;
+            if (retry_delay > 30) retry_delay = 30; // Cap max delay
             continue;
         }
         retry_count = 0;
@@ -477,13 +584,32 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    if (ota_->HasMqttConfig()) {
+    // Read protocol config from NVS settings (set during activation or OTA)
+    Settings mqtt_settings("mqtt", false);
+    Settings ws_settings("websocket", false);
+    bool has_mqtt = mqtt_settings.GetString("endpoint").length() > 0;
+    bool has_ws = ws_settings.GetString("url").length() > 0;
+
+    if (has_mqtt) {
         protocol_ = std::make_unique<MqttProtocol>();
-    } else if (ota_->HasWebsocketConfig()) {
-        protocol_ = std::make_unique<WebsocketProtocol>();
     } else {
-        ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
-        protocol_ = std::make_unique<MqttProtocol>();
+        // Default to WebSocket
+        if (!has_ws) {
+            ESP_LOGW(TAG, "No protocol URL configured, using default WebSocket");
+            Settings ws_write("websocket", true);
+            // Derive from OTA URL compile-time config
+            std::string ota = CONFIG_OTA_URL;
+            size_t p = ota.find("://");
+            if (p != std::string::npos) {
+                p += 3;
+                size_t e = ota.find('/', p);
+                std::string url = "ws://" + ota.substr(p, e - p) + "/xiaozhi/v1";
+                ws_write.SetString("url", url);
+                ws_write.SetInt("version", 3);
+                ESP_LOGI(TAG, "Default WebSocket URL: %s", url.c_str());
+            }
+        }
+        protocol_ = std::make_unique<WebsocketProtocol>();
     }
 
     protocol_->OnConnected([this]() {
@@ -589,6 +715,14 @@ void Application::InitializeProtocol() {
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
             }
+        } else if (strcmp(type->valuestring, "bind_qr") == 0) {
+            auto url = cJSON_GetObjectItem(root, "url");
+            if (cJSON_IsString(url)) {
+                ESP_LOGI(TAG, "Received bind QR request: %s", url->valuestring);
+                Schedule([display, url_str = std::string(url->valuestring)]() {
+                    ShowQrCode(url_str, 120);
+                });
+            }
 #if CONFIG_RECEIVE_CUSTOM_MESSAGE
         } else if (strcmp(type->valuestring, "custom") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
@@ -673,7 +807,7 @@ void Application::StopListening() {
 
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
-    
+
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -688,21 +822,30 @@ void Application::HandleToggleChatEvent() {
     }
 
     if (!protocol_) {
-        ESP_LOGE(TAG, "Protocol not initialized");
+        ESP_LOGW(TAG, "Protocol not initialized, re-running activation");
+        SetDeviceState(kDeviceStateActivating);
+        xTaskCreate([](void* arg) {
+            Application* app = static_cast<Application*>(arg);
+            app->ActivationTask();
+            app->activation_task_handle_ = nullptr;
+            vTaskDelete(NULL);
+        }, "activation_retry", 4096 * 2, this, 2, &activation_task_handle_);
         return;
     }
 
     if (state == kDeviceStateIdle) {
-        ListeningMode mode = GetDefaultListeningMode();
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
-            Schedule([this, mode]() {
+            Schedule([this, mode = GetDefaultListeningMode()]() {
                 ContinueOpenAudioChannel(mode);
             });
             return;
         }
-        SetListeningMode(mode);
+        SetListeningMode(GetDefaultListeningMode());
+    } else if (state == kDeviceStateConnecting) {
+        // Cancel connection attempt — go back to idle
+        protocol_->CloseAudioChannel();
+        SetDeviceState(kDeviceStateIdle);
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
