@@ -25,7 +25,7 @@ Step 1: 读取 WiFi 配网页（192.168.4.1）中用户自定义的 OTA URL
 
 Step 2: 按顺序探测内置候选服务器
    1. http://192.168.0.88:8003/health     → ws://192.168.0.88:8003/xiaozhi/v1
-   2. http://hass.iala.top:8003/health    → ws://hass.iala.top:8003/xiaozhi/v1
+   2. http://mcp.myserver.top:8003/health    → ws://mcp.myserver.top:8003/xiaozhi/v1
    3. https://api.tenclass.net/xiaozhi/ota/ → 解析返回的 wss:// 地址（带 token）
 
 Step 3: 全部不通 → 默认用 ws://192.168.0.88:8003/xiaozhi/v1
@@ -68,7 +68,7 @@ Step 3: 全部不通 → 默认用 ws://192.168.0.88:8003/xiaozhi/v1
 
 WiFi 配网页（192.168.4.1）的 OTA 地址字段可以填入任意 MCP 服务器的 URL，固件优先使用该地址。例如：
 
-- `http://hass.iala.top:8003/xiaozhi/ota/` — 连本地/远程桥接服务器
+- `http://mcp.myserver.top:8003/xiaozhi/ota/` — 连本地/远程桥接服务器
 - `https://api.tenclass.net/xiaozhi/ota/` — 连 xiaozhi.me 官方服务器
 
 ### 6. 编译期配置
@@ -127,7 +127,7 @@ CONFIG_OTA_URL="http://192.168.0.148:8003/xiaozhi/ota/"
 
 ### 部署
 
-**已有服务器：** `hass.iala.top:8003`（已部署运行）
+**已有服务器：** `mcp.myserver.top:8003`（已部署运行）
 
 **Linux 一键部署：**
 ```bash
@@ -152,7 +152,7 @@ chmod +x /opt/xiaozhi-bridge
   "channels": {
     "xiaozhi": {
       "enabled": true,
-      "xiaozhiServerUrl": "http://hass.iala.top:8003",
+      "xiaozhiServerUrl": "http://mcp.myserver.top:8003",
       "deviceId": "10:20:ba:6c:d2:40",
       "timeout": 30
     }
@@ -170,7 +170,7 @@ chmod +x /opt/xiaozhi-bridge
 
 ```
 用户对ESP32说话 "微信绑定"
-  → ESP32 WebSocket → hass.iala.top:8003 (桥接)
+  → ESP32 WebSocket → mcp.myserver.top:8003 (桥接)
   → 插件长轮询 /xiaozhi/updates → OpenClaw Main Agent
   → 智能体识别意图 → 回复 "!bind"
   → 桥接检测到 !bind → 生成绑定URL → push bind_qr 到 ESP32

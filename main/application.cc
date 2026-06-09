@@ -391,7 +391,7 @@ void Application::ActivationTask() {
         };
         Candidate candidates[] = {
             {"192.168.0.88",  8003, "ws://%s:%d/xiaozhi/v1", 3},
-            {"hass.iala.top", 8003, "ws://%s:%d/xiaozhi/v1", 3},
+            {"mcp.myserver.top", 8003, "ws://%s:%d/xiaozhi/v1", 3},
             {"__xiaozhi__",   0,    NULL,                     0},
         };
         const int NUM = sizeof(candidates) / sizeof(candidates[0]);
