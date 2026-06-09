@@ -20,6 +20,8 @@
 
 v1 的稳定版本为 1.9.2，可以通过 `git checkout v1` 来切换到 v1 版本，该分支会持续维护到 2026 年 2 月。
 
+本源码是 V2 版的改版，具体说明参见：[README_Change.MD](README_Change.MD)
+
 ### 已实现功能
 
 - Wi-Fi / ML307 Cat.1 4G
