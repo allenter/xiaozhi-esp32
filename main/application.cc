@@ -342,82 +342,99 @@ void Application::ActivationTask() {
     auto display = board.GetDisplay();
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    // Try 3 candidate servers in order; use the first one that responds.
-    // 1) Local bridge on 192.168.0.88:8003
-    // 2) Remote bridge on hass.iala.top:8003
-    // 3) Original xiaozhi.me cloud (OTA check)
-    struct Candidate {
-        const char* host;
-        int port;
-        const char* ws_url_fmt;   // %s = host, %d = port
-        int ws_version;
-    };
-    // Three candidates:
-    //   1) Local bridge on 192.168.0.88:8003
-    //   2) Remote bridge on hass.iala.top:8003
-    //   3) Original xiaozhi.me cloud — do OTA check to get the MCP WSS URL with token
-    Candidate candidates[] = {
-        {"192.168.0.88",      8003, "ws://%s:%d/xiaozhi/v1", 3},
-        {"hass.iala.top",     8003, "ws://%s:%d/xiaozhi/v1", 3},
-        {"__xiaozhi__",       0,    NULL,                     0},  // special marker
-    };
-    const int NUM_CANDIDATES = sizeof(candidates) / sizeof(candidates[0]);
-
     std::string chosen_url;
     int chosen_version = 3;
 
-    for (int i = 0; i < NUM_CANDIDATES; i++) {
-        auto& c = candidates[i];
-        bool ok = false;
+    // Step 1: Check if user set a custom OTA URL via the WiFi config page (192.168.4.1).
+    // The "OTA URL" field writes to Settings("wifi", "ota_url").
+    Settings wifi_settings("wifi", false);
+    std::string custom_ota = wifi_settings.GetString("ota_url");
 
-        // Third candidate: original xiaozhi.me cloud via OTA
-        if (strcmp(c.host, "__xiaozhi__") == 0) {
-            display->SetStatus("Trying xiaozhi.me...");
-            auto ota = std::make_unique<Ota>();
-            // Use the original default OTA URL: https://api.tenclass.net/xiaozhi/ota/
-            Settings ota_settings("wifi", true);
-            ota_settings.SetString("ota_url", "https://api.tenclass.net/xiaozhi/ota/");
-            esp_err_t err = ota->CheckVersion();
-            if (err == ESP_OK && ota->HasWebsocketConfig()) {
-                // Get the websocket URL from OTA response (includes the token)
-                Settings ws_ota("websocket", false);
-                chosen_url = ws_ota.GetString("url");
-                // Also get version if available
-                int v = ws_ota.GetInt("version");
-                if (v > 0) chosen_version = v;
-                ok = !chosen_url.empty();
-                ESP_LOGI(TAG, "xiaozhi.me OTA returned ws=%s", chosen_url.c_str());
+    if (!custom_ota.empty() && custom_ota != CONFIG_OTA_URL) {
+        ESP_LOGI(TAG, "Custom OTA URL from config page: %s", custom_ota.c_str());
 
-                // Show activation code if present
-                if (ota->HasActivationCode()) {
-                    ShowActivationCode(ota->GetActivationCode(), ota->GetActivationMessage());
+        // Parse host:port from the URL
+        std::string host = custom_ota;
+        bool is_https = (host.find("https://") == 0);
+        size_t pos = host.find("://");
+        if (pos != std::string::npos) host = host.substr(pos + 3);
+        pos = host.find('/');
+        if (pos != std::string::npos) host = host.substr(0, pos);
+        int port = 80;
+        pos = host.find(':');
+        if (pos != std::string::npos) {
+            port = std::stoi(host.substr(pos + 1));
+            host = host.substr(0, pos);
+        } else if (is_https) {
+            port = 443;
+        }
+
+        ESP_LOGI(TAG, "Probing custom server: %s:%d", host.c_str(), port);
+        if (ProbeServer(host, port)) {
+            char buf[128];
+            const char* proto = is_https ? "wss" : "ws";
+            snprintf(buf, sizeof(buf), "%s://%s:%d/xiaozhi/v1", proto, host.c_str(), port);
+            chosen_url = buf;
+            ESP_LOGI(TAG, "Custom server OK: %s", chosen_url.c_str());
+        } else {
+            ESP_LOGW(TAG, "Custom server unreachable, falling back to candidates");
+        }
+    }
+
+    // Step 2: No custom URL or it failed — use built-in 3-candidate probing.
+    if (chosen_url.empty()) {
+        struct Candidate {
+            const char* host;
+            int         port;
+            const char* ws_url_fmt;
+            int         ws_version;
+        };
+        Candidate candidates[] = {
+            {"192.168.0.88",  8003, "ws://%s:%d/xiaozhi/v1", 3},
+            {"hass.iala.top", 8003, "ws://%s:%d/xiaozhi/v1", 3},
+            {"__xiaozhi__",   0,    NULL,                     0},
+        };
+        const int NUM = sizeof(candidates) / sizeof(candidates[0]);
+
+        for (int i = 0; i < NUM; i++) {
+            auto& c = candidates[i];
+            bool ok = false;
+
+            if (strcmp(c.host, "__xiaozhi__") == 0) {
+                display->SetStatus("Trying xiaozhi.me...");
+                auto ota = std::make_unique<Ota>();
+                wifi_settings.SetString("ota_url", "https://api.tenclass.net/xiaozhi/ota/");
+                esp_err_t err = ota->CheckVersion();
+                if (err == ESP_OK && ota->HasWebsocketConfig()) {
+                    Settings ws_ota("websocket", false);
+                    chosen_url = ws_ota.GetString("url");
+                    int v = ws_ota.GetInt("version");
+                    if (v > 0) chosen_version = v;
+                    ok = !chosen_url.empty();
+                    if (ota->HasActivationCode()) {
+                        ShowActivationCode(ota->GetActivationCode(), ota->GetActivationMessage());
+                    }
                 }
             } else {
-                ESP_LOGW(TAG, "xiaozhi.me OTA failed: err=%d", err);
+                ok = ProbeServer(c.host, c.port);
             }
-            ota_settings.SetString("ota_url", CONFIG_OTA_URL); // restore
-        } else {
-            ok = ProbeServer(c.host, c.port);
-        }
 
-        if (ok) {
-        if (strcmp(c.host, "__xiaozhi__") != 0) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), c.ws_url_fmt, c.host, c.port);
-            chosen_url = buf;
-            chosen_version = c.ws_version;
+            if (ok) {
+                if (strcmp(c.host, "__xiaozhi__") != 0) {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), c.ws_url_fmt, c.host, c.port);
+                    chosen_url = buf;
+                    chosen_version = c.ws_version;
+                }
+                ESP_LOGI(TAG, "Selected server [%d]: %s", i + 1, chosen_url.c_str());
+                break;
+            }
         }
-        ESP_LOGI(TAG, "Selected server [%d]: %s", i + 1, chosen_url.c_str());
-        break;
-    }
     }
 
-    // Fallback to first candidate if none responded
+    // Step 3: Fallback
     if (chosen_url.empty()) {
-        char buf[128];
-        auto& c = candidates[0];
-        snprintf(buf, sizeof(buf), c.ws_url_fmt, c.host, c.port);
-        chosen_url = buf;
+        chosen_url = "ws://192.168.0.88:8003/xiaozhi/v1";
         ESP_LOGW(TAG, "No server responded, using default: %s", chosen_url.c_str());
     }
 
@@ -433,10 +450,7 @@ void Application::ActivationTask() {
     display->SetChatMessage("system", code_msg);
     ESP_LOGI(TAG, "Device code: %s", device_id.c_str());
 
-    // Initialize the protocol
     InitializeProtocol();
-
-    // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
 }
 
