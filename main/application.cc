@@ -399,7 +399,7 @@ void Application::ActivationTask() {
             int         ws_version;
         };
         Candidate candidates[] = {
-            {"192.168.0.88",        8003, "ws://%s:%d/xiaozhi/v1", 3},
+            {"192.168.0.183",       8003, "ws://%s:%d/xiaozhi/v1", 3},
             {"mcp.myserver.top",    8003, "ws://%s:%d/xiaozhi/v1", 3},
             {"__xiaozhi__",         0,    NULL,                     0},
         };
@@ -462,7 +462,7 @@ void Application::ActivationTask() {
             }
             ESP_LOGW(TAG, "Using user OTA URL directly: %s", chosen_url.c_str());
         } else {
-            chosen_url = "ws://192.168.0.88:8003/xiaozhi/v1";
+            chosen_url = "ws://192.168.0.183:8003/xiaozhi/v1";
             ESP_LOGW(TAG, "Fallback: %s", chosen_url.c_str());
         }
     }
