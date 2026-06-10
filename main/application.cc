@@ -318,32 +318,12 @@ void Application::HandleActivationDoneEvent() {
     });
 }
 
-// Probe a candidate server with a quick HTTP GET /health.
-// Returns true if the server responds with HTTP 200.
-static bool ProbeServer(const std::string& host, int port) {
-    auto network = Board::GetInstance().GetNetwork();
-    auto http = network->CreateHttp(0);
-    char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d/health", host.c_str(), port);
-    ESP_LOGI("Probe", "Trying %s ...", url);
-    if (!http->Open("GET", url)) {
-        ESP_LOGW("Probe", "%s: connection failed (err=0x%x)", url, http->GetLastError());
-        return false;
-    }
-    int status = http->GetStatusCode();
-    http->Close();
-    bool ok = (status == 200);
-    ESP_LOGI("Probe", "%s -> HTTP %d (%s)", url, status, ok ? "OK" : "FAIL");
-    return ok;
-}
-
 void Application::ActivationTask() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    // Clear any stale websocket URL from previous OTA sessions.
-    // The WiFi config page's OTA URL takes priority.
+    // Clear stale NVS, then let OTA — or a direct parse — pick the WebSocket URL.
     Settings ws_settings("websocket", true);
     ws_settings.EraseKey("url");
     ws_settings.EraseKey("version");
@@ -351,15 +331,34 @@ void Application::ActivationTask() {
     std::string chosen_url;
     int chosen_version = 3;
 
-    // Step 1: Read the user's OTA URL from WiFi config page (192.168.4.1).
     Settings wifi_settings("wifi", false);
-    std::string custom_ota = wifi_settings.GetString("ota_url");
+    std::string ota_url = wifi_settings.GetString("ota_url");
 
-    if (!custom_ota.empty()) {
-        ESP_LOGI(TAG, "OTA URL from config: %s", custom_ota.c_str());
+    // Step 1: Call the OTA server (user-configured or default).
+    // Ota::CheckVersion uses whatever URL is in Settings("wifi", "ota_url").
+    {
+        auto ota = std::make_unique<Ota>();
+        esp_err_t err = ota->CheckVersion();
+        if (err == ESP_OK) {
+            if (ota->HasWebsocketConfig()) {
+                Settings ws("websocket", false);
+                chosen_url = ws.GetString("url");
+                int v = ws.GetInt("version");
+                if (v > 0) chosen_version = v;
+                ESP_LOGI(TAG, "OTA returned ws=%s", chosen_url.c_str());
+            }
+            if (ota->HasActivationCode()) {
+                ShowActivationCode(ota->GetActivationCode(), ota->GetActivationMessage());
+            }
+        } else {
+            ESP_LOGW(TAG, "OTA check failed (err=%d)", err);
+        }
+    }
 
-        // Parse host:port from the URL (supports ws://, wss://, http://, https://)
-        std::string host = custom_ota;
+    // Step 2: If OTA didn't give a WebSocket URL (e.g. custom bridge without OTA endpoint),
+    // build ws://host:port/xiaozhi/v1 from the OTA URL itself.
+    if (chosen_url.empty() && !ota_url.empty()) {
+        std::string host = ota_url;
         bool is_ssl = (host.find("wss://") == 0 || host.find("https://") == 0);
         size_t pos = host.find("://");
         if (pos != std::string::npos) host = host.substr(pos + 3);
@@ -373,105 +372,22 @@ void Application::ActivationTask() {
         } else if (is_ssl) {
             port = 443;
         }
-
-        // Try the user's server up to 3 times with brief delays.
-        // If the user explicitly configured this server, we stick with it.
-        for (int attempt = 0; attempt < 3; attempt++) {
-            if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(2000));
-            if (ProbeServer(host, port)) {
-                char buf[128];
-                const char* proto = is_ssl ? "wss" : "ws";
-                snprintf(buf, sizeof(buf), "%s://%s:%d/xiaozhi/v1", proto, host.c_str(), port);
-                chosen_url = buf;
-                ESP_LOGI(TAG, "Custom server OK [attempt %d]: %s", attempt + 1, chosen_url.c_str());
-                break;
-            }
-            ESP_LOGW(TAG, "Custom server attempt %d/3 failed", attempt + 1);
-        }
+        const char* proto = is_ssl ? "wss" : "ws";
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s://%s:%d/xiaozhi/v1", proto, host.c_str(), port);
+        chosen_url = buf;
+        ESP_LOGI(TAG, "Built URL from OTA host: %s", chosen_url.c_str());
     }
 
-    // Step 2: No custom URL set — try built-in candidates.
-    if (chosen_url.empty() && custom_ota.empty()) {
-        struct Candidate {
-            const char* host;
-            int         port;
-            const char* ws_url_fmt;
-            int         ws_version;
-        };
-        Candidate candidates[] = {
-            {"192.168.0.88",        8003, "ws://%s:%d/xiaozhi/v1", 3},
-            {"mcp.myserver.top",    8003, "ws://%s:%d/xiaozhi/v1", 3},
-            {"__xiaozhi__",         0,    NULL,                     0},
-        };
-        const int NUM = sizeof(candidates) / sizeof(candidates[0]);
-
-        for (int i = 0; i < NUM; i++) {
-            auto& c = candidates[i];
-            bool ok = false;
-
-            if (strcmp(c.host, "__xiaozhi__") == 0) {
-                display->SetStatus("Trying xiaozhi.me...");
-                auto ota = std::make_unique<Ota>();
-                esp_err_t err = ota->CheckVersion();
-                if (err == ESP_OK && ota->HasWebsocketConfig()) {
-                    Settings ws_ota("websocket", false);
-                    chosen_url = ws_ota.GetString("url");
-                    int v = ws_ota.GetInt("version");
-                    if (v > 0) chosen_version = v;
-                    ok = !chosen_url.empty();
-                    if (ota->HasActivationCode()) {
-                        ShowActivationCode(ota->GetActivationCode(), ota->GetActivationMessage());
-                    }
-                }
-            } else {
-                ok = ProbeServer(c.host, c.port);
-            }
-
-            if (ok) {
-                if (strcmp(c.host, "__xiaozhi__") != 0) {
-                    char buf[128];
-                    snprintf(buf, sizeof(buf), c.ws_url_fmt, c.host, c.port);
-                    chosen_url = buf;
-                    chosen_version = c.ws_version;
-                }
-                ESP_LOGI(TAG, "Selected server [%d]: %s", i + 1, chosen_url.c_str());
-                break;
-            }
-        }
-    }
-
-    // Step 3: Fallback — use the user's config URL directly even if probe failed.
+    // Step 3: No OTA URL at all — use compile-time default.
     if (chosen_url.empty()) {
-        if (!custom_ota.empty()) {
-            // Trust the user: use their URL even if /health probe timed out.
-            // Replace http→ws, https→wss for WebSocket.
-            if (custom_ota.find("://") == std::string::npos) {
-                chosen_url = "ws://" + custom_ota + ":" + std::to_string(8003) + "/xiaozhi/v1";
-            } else {
-                chosen_url = custom_ota;
-                // Fix protocol: http:// → ws://, https:// → wss://
-                if (chosen_url.find("http://") == 0)
-                    chosen_url.replace(0, 7, "ws://");
-                else if (chosen_url.find("https://") == 0)
-                    chosen_url.replace(0, 8, "wss://");
-                // Append /xiaozhi/v1 if not present
-                if (chosen_url.find("/xiaozhi/v1") == std::string::npos) {
-                    if (chosen_url.back() != '/') chosen_url += '/';
-                    chosen_url += "xiaozhi/v1";
-                }
-            }
-            ESP_LOGW(TAG, "Using user OTA URL directly: %s", chosen_url.c_str());
-        } else {
-            chosen_url = "ws://192.168.0.88:8003/xiaozhi/v1";
-            ESP_LOGW(TAG, "Fallback: %s", chosen_url.c_str());
-        }
+        chosen_url = "ws://192.168.0.88:8003/xiaozhi/v1";
+        ESP_LOGW(TAG, "Using default: %s", chosen_url.c_str());
     }
 
-    // Store the chosen URL
     ws_settings.SetString("url", chosen_url);
     ws_settings.SetInt("version", chosen_version);
 
-    // Show device identifier on screen
     std::string device_id = SystemInfo::GetMacAddress();
     char code_msg[64];
     snprintf(code_msg, sizeof(code_msg), "Code: %s", device_id.c_str());

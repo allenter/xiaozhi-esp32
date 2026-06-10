@@ -77,5 +77,5 @@ CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
 
 # Custom OTA URL pointing to local bridge
-CONFIG_OTA_URL="http://192.168.0.148:8003/xiaozhi/ota/"
+CONFIG_OTA_URL="https://api.tenclass.net/xiaozhi/ota/"
 
